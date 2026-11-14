@@ -1,0 +1,64 @@
+/* emit.h — turning discovered functions into C. */
+
+#ifndef ARMRECOMP_EMIT_H
+#define ARMRECOMP_EMIT_H
+
+#include "analyze.h"
+#include "nids.h"
+
+#include <stdio.h>
+
+/* What is still trapping, by kind.
+ *
+ * "31% untranslated" is not actionable; "MOVT is 40% of what is left" is. This
+ * table is what turns the question of where to spend effort next from a guess
+ * into a ranked list — and it is how MOVT was found to be worth far more than
+ * its instruction count suggested. */
+#define EM_MAX_TRAP_KINDS 64
+
+typedef struct {
+    const char *what;      /* mnemonic, or the class when unnamed */
+    uint32_t    count;
+} em_trap_kind;
+
+typedef struct {
+    uint32_t funcs;
+    uint32_t insns;
+    uint32_t translated;   /* emitted as real C            */
+    uint32_t trapped;      /* emitted as a named trap      */
+    uint32_t overlaps;     /* fall-throughs past an overlapping decode (jump table read too far) */
+    uint32_t literals;     /* literal-pool loads folded to constants */
+    uint32_t promoted;     /* off-bound code made a function of its own  */
+    uint32_t neon;         /* NEON instructions handed to the runtime    */
+    uint32_t neon_inline;  /* of those, written out as C (neon_emit.h)   */
+    uint32_t varrefs;      /* MOVW/MOVT relocated to an imported variable */
+    uint32_t import_calls; /* call sites bound to a firmware import  */
+    uint32_t imports_used; /* distinct imports actually reached      */
+
+    /* Addresses discovery registered as functions that are really import
+     * stubs. The stub wins in the dispatch table; this counts how often
+     * discovery walked into the import table and believed what it found. */
+    uint32_t stub_shadowed;
+
+    em_trap_kind traps[EM_MAX_TRAP_KINDS];
+    uint32_t     trap_kinds;
+    uint32_t     traps_other;   /* beyond the table's capacity */
+} emit_stats;
+
+/* Emit discovered functions to `out`. `limit` caps the number emitted (0 for
+ * all), which matters for bring-up: 19k functions is 133 MB of C, and getting
+ * a few hundred to compile and link proves the translation is valid C long
+ * before the whole module is worth building.
+ *
+ * `impdir` receives ONE FILE PER IMPORT, which is not tidiness — it is what
+ * makes an import overridable. The defaults are meant to be built into a
+ * static library and listed after the runtime, and a linker pulls an archive
+ * member only for a symbol still undefined. At one member per function a real
+ * implementation simply wins. Put all 524 in a single translation unit and the
+ * ~500 unimplemented ones drag the whole object in, taking the implemented
+ * definitions with them and colliding with every real one. */
+int em_emit(const vm_image *img, const vm_module *mod, const nid_db *db,
+            const vf_result *disc, FILE *out, const char *impdir,
+            uint32_t limit, emit_stats *st);
+
+#endif /* ARMRECOMP_EMIT_H */

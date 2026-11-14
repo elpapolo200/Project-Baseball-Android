@@ -1,0 +1,27 @@
+# Nunca subir nada del juego ni compilado / Never commit game content or build output
+*.elf
+eboot*.bin
+*.arc
+*.so
+*.apk
+*.aab
+*.tp2
+*.pp2
+*.xbn
+libjuego*
+PCSA00511/
+
+# compilación
+build/
+.gradle/
+.cxx/
+local.properties
+*.log
+fuente/gen/
+fuente/salida/
+fuente/obj_prueba/
+fuente/prueba*/
+pruebas/
+herramientas/
+__pycache__/
+!fuente/android/libjuego.map

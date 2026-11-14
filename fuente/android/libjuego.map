@@ -1,0 +1,14 @@
+/* Lo que libjuego.so ofrece al port (juego_dll.c); el resto (42 000 funciones traducidas, memcpy...)
+ * queda local. */
+{
+  global:
+    vita_cpu_tls;
+    vita_mem_directa;
+    vita_register_functions;
+    vita_func_810056D4;
+    vita_func_81B078C8;
+    vita_import_vars;
+    vita_import_var_count;
+  local:
+    *;
+};

@@ -1,0 +1,831 @@
+/* analyze.c — function discovery by recursive descent.
+ *
+ * The walk carries (address, mode) pairs rather than bare addresses. Every
+ * seed records the instruction set it was reached in, because there is no way
+ * to recover that from the bytes: Thumb decoded as ARM yields instructions, not
+ * errors.
+ */
+
+#include "analyze.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* --- the visited bitmap ---------------------------------------------------- */
+/* One bit per 2 bytes: the finest granularity an instruction can start on. */
+
+static int seen_get(const vf_result *r, uint32_t off) {
+    uint32_t i = off >> 1;
+    return (r->seen[i >> 3] >> (i & 7)) & 1;
+}
+
+static void seen_set(vf_result *r, uint32_t off) {
+    uint32_t i = off >> 1;
+    r->seen[i >> 3] |= (uint8_t)(1u << (i & 7));
+}
+
+/* --- a queue of (address, mode) seeds -------------------------------------- */
+
+typedef struct { uint32_t addr; arm_mode mode; uint8_t heur; } seed;
+
+typedef struct { seed *v; uint32_t n, cap; } seedq;
+
+static void sq_push(seedq *q, uint32_t addr, arm_mode mode, uint8_t heur) {
+    if (q->n == q->cap) {
+        q->cap = q->cap ? q->cap * 2 : 1024;
+        q->v = (seed *)realloc(q->v, q->cap * sizeof(seed));
+    }
+    q->v[q->n].addr = addr;
+    q->v[q->n].mode = mode;
+    q->v[q->n].heur = heur;
+    q->n++;
+    extern uint32_t g_dbg_trace_addr;   /* VITA_DBGA: dirección a rastrear (0 = nada) */
+    if (g_dbg_trace_addr && addr == g_dbg_trace_addr)
+        fprintf(stderr, "[sq] push %08X heur=%u n=%u\n", addr, heur, q->n);
+}
+
+static void add_func(vf_result *r, uint32_t addr, arm_mode mode, uint8_t heur) {
+    if (r->count == r->cap) {
+        r->cap = r->cap ? r->cap * 2 : 4096;
+        r->funcs = (vf_func *)realloc(r->funcs, r->cap * sizeof(vf_func));
+    }
+    vf_func *f = &r->funcs[r->count++];
+    memset(f, 0, sizeof(*f));
+    f->addr = addr;
+    f->mode = mode;
+    f->from_heuristic = heur;
+}
+
+/* Should a mode-switching call be followed into ARM?
+ *
+ * Only when the target is a known import stub. The stubs are this module's ARM
+ * code — placeholder bodies the loader patches — and a BLX to one is the
+ * ordinary way a Thumb module calls firmware. A BLX-immediate pointing
+ * anywhere else is, on this corpus, a misdecode: the tail of .text is
+ * read-only data, and data decoded as Thumb produces plausible BLX encodings
+ * in quantity.
+ *
+ * Refusing matters more here than for any other seed, because the two decoders
+ * fail differently. The Thumb decoder returns UNKNOWN often enough to stop a
+ * runaway walk; the ARM decoder assigns a class to every op value, so it never
+ * stops on its own. One bad ARM seed does not produce one bad function, it
+ * produces thousands of instructions of confident nonsense — 152,919 of them
+ * before this check existed, against 1.58 million real ones. */
+static int arm_seed_ok(const vm_module *mod, uint32_t target) {
+    return vm_find_stub(mod, target) != NULL;
+}
+
+/* --- walking one function --------------------------------------------------- */
+/*
+ * Follows local control flow from `start`, marking instruction starts and
+ * queueing call targets as new functions. Branch targets are followed as local
+ * flow; a branch that is really a tail call therefore merges the callee into
+ * this function's extent, which inflates extent without losing correctness —
+ * every instruction still gets decoded exactly once, from the right mode.
+ */
+
+static void walk(const vm_image *img, const vm_module *mod, vf_result *r,
+                 seedq *q, uint32_t start, arm_mode mode, vf_func *fn) {
+    const uint8_t *text = img->data + img->seg_file;
+    const uint32_t base = img->seg_vaddr;
+    const uint32_t len  = img->seg_len;
+
+    /* Local block worklist. Bounded: a pathological function cannot make this
+     * grow without bound because every block start is marked seen first. */
+    seedq local = {0};
+    sq_push(&local, start, mode, 0);
+
+    while (local.n) {
+        seed s = local.v[--local.n];
+        uint32_t a = s.addr;
+        extern uint32_t g_dbg_trace_addr;
+        if (g_dbg_trace_addr && a == g_dbg_trace_addr)
+            fprintf(stderr, "[walk] semilla %08X procesada (fn=%08X)\n", a, fn ? fn->addr : 0);
+        int cmp_reg = -1;       /* last `cmp rX, #imm`: bounds a table branch */
+        uint32_t cmp_imm = 0;
+        int prev_reg = -1, lo_check = 0;
+        uint32_t prev_imm = 0;
+        arm_it its;
+        arm_it_reset(&its);                       /* a block never starts inside IT */
+
+        for (;;) {
+            if (a < base || a >= base + len) break;
+            uint32_t off = a - base;
+            if (seen_get(r, off)) {
+                extern uint32_t g_dbg_trace_addr;
+                if (g_dbg_trace_addr && (a == g_dbg_trace_addr || a + 4 == g_dbg_trace_addr || a + 2 == g_dbg_trace_addr))
+                    fprintf(stderr, "[walk] %08X ya visto: paro el bloque (fn=%08X)\n", a, fn ? fn->addr : 0);
+                break;          /* already decoded here */
+            }
+
+            arm_insn in;
+            int n = arm_decode(text, base, len, a, s.mode, &in);
+            if (n == 0) break;
+            arm_it_apply(&its, &in);
+
+            seen_set(r, off);
+            r->insns_total++;
+            r->bytes_covered += (uint32_t)n;
+            fn->insns++;
+            if (a + (uint32_t)n > fn->end) fn->end = a + (uint32_t)n;
+            if (in.cls == A_SIMD) r->simd_insns++;
+
+            /* Calls seed new functions. An interworking call flips the mode of
+             * the callee, which is the whole reason mode travels with a seed. */
+            if (in.cls == A_CALL) {
+                if (in.has_target) {
+                    arm_mode cm = in.switches_mode
+                                ? (s.mode == ARM_T32 ? ARM_A32 : ARM_T32)
+                                : s.mode;
+                    /* A mode-switching call is only followed into ARM when the
+                     * target is a known import stub.
+                     *
+                     * The stubs are the module's ARM code — placeholder bodies
+                     * the loader patches — and a BLX to one is the ordinary way
+                     * a Thumb module calls firmware. A BLX-immediate pointing
+                     * anywhere else is, on this corpus, a misdecode: the tail of
+                     * .text is read-only data, and data decoded as Thumb
+                     * produces plausible BLX encodings.
+                     *
+                     * Refusing matters more here than for any other seed
+                     * because of an asymmetry between the decoders. The Thumb
+                     * decoder returns UNKNOWN often enough to stop a runaway
+                     * walk; the ARM decoder assigns a class to every op value,
+                     * so it never stops on its own. One bad ARM seed does not
+                     * produce one bad function, it produces thousands of
+                     * instructions of confident nonsense — 152,919 of them
+                     * before this check existed. */
+                    if (cm == ARM_A32 && s.mode == ARM_T32 &&
+                        !arm_seed_ok(mod, in.target)) {
+                        r->seeds_arm_refused++;
+                    } else {
+                        sq_push(q, in.target, cm, 0);
+                        r->seeds_call++;
+                    }
+                } else {
+                    /* A register-form BLX. It is a call whose destination is
+                     * computed, so it seeds nothing and the callee is reachable
+                     * only through a stored pointer. Counting these separately
+                     * is what makes the shape heuristic's job visible: they are
+                     * the calls whose targets discovery cannot follow. */
+                    r->indirect_sites++;
+                }
+                a += (uint32_t)n;
+                continue;
+            }
+
+            if (in.cls == A_RETURN && !in.conditional) break;   /* `bxeq lr` in IT falls through */
+
+            /* `cmp r0, #0x50; bgt out; cmp r0, #0x1f; ble out; subs r0, #0x20; tbh`: the
+             * second cmp is a LOWER bound. Taking it as the count read 32 of 49 entries.
+             * A cmp whose very next instruction branches on le/lt/ls/lo keeps the upper
+             * bound already known for that register. */
+            if (lo_check) {
+                lo_check = 0;
+                if (in.cls == A_BRANCH && in.has_target && prev_reg == cmp_reg &&
+                    (in.cond == 0xD || in.cond == 0xB || in.cond == 0x9 || in.cond == 0x3)) cmp_imm = prev_imm;
+            }
+            if (in.op == OP_CMP && in.has_imm) {
+                prev_reg = cmp_reg; prev_imm = cmp_imm;
+                cmp_reg = in.rn; cmp_imm = in.imm; lo_check = 1;
+            }
+            /* `cmp r2, #44; ...; subs r2, #10; tbb [pc, r2]`: the index is 0..34. Reading 45
+             * entries ran into the padding after the table and the table was dropped. */
+            else if (in.op == OP_SUB && in.has_imm && cmp_reg >= 0 && in.rn == cmp_reg && in.imm <= cmp_imm) {
+                cmp_imm -= in.imm;
+                cmp_reg = in.rd;
+            }
+            if (in.op == OP_TBB || in.op == OP_TBH) {
+                uint32_t tt[1024];
+                uint32_t cnt = (cmp_reg == in.rm) ? cmp_imm + 1 : 0;
+                int nt = arm_table_targets(text, base, len, &in, cnt, tt, 1024);
+                for (int k = 0; k < nt; k++) sq_push(&local, tt[k], s.mode, 0);
+                if (nt) break;
+            }
+
+            if (in.cls == A_INDIRECT) { r->indirect_sites++; if (!in.conditional) break; }
+
+            if (in.cls == A_BRANCH && in.has_target) {
+                sq_push(&local, in.target, s.mode, 0);
+                if (!in.conditional) break;       /* unconditional: flow ends */
+            }
+
+            a += (uint32_t)n;
+        }
+    }
+
+    free(local.v);
+}
+
+/* --- pointer-shape recovery ------------------------------------------------- */
+/*
+ * With no relocations, stored function pointers can only be recognised by what
+ * they look like. A candidate word must land inside the executable segment, be
+ * correctly aligned, and decode as something. That is a heuristic and is
+ * reported as one — it will both miss real pointers and admit false ones.
+ *
+ * The Thumb bit is the one genuinely reliable signal here: a stored pointer to
+ * Thumb code has bit 0 set, because that is how the hardware switches mode on
+ * an indirect branch. A word with bit 0 set that otherwise looks like a code
+ * address is far more likely to be a real function pointer than a coincidence.
+ */
+
+/* Does this word have the SHAPE of a pointer to Thumb code? Cheap, and
+ * deliberately says nothing about whether a function is there. */
+static int code_ptr_shape(const vm_image *img, const uint8_t *p, uint32_t *out) {
+    uint32_t w = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+               | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    if (!(w & 1)) return 0;                       /* Thumb pointers only */
+    uint32_t t = w & ~1u;
+    if (t < img->seg_vaddr || t >= img->seg_vaddr + img->seg_len) return 0;
+    if ((t - img->seg_vaddr) & 1) return 0;
+    *out = t;
+    return 1;
+}
+
+/* How many consecutive words from `off` have that shape.
+ *
+ * This is the evidence that turns a guess into a reading. Adjacent words that
+ * are all Thumb-tagged, all correctly aligned, and all land inside a 5.6 MB
+ * window of a 4 GB space do not happen by accident. Such a run is a POINTER
+ * TABLE, and knowing that is worth more than any property of the individual
+ * entries.
+ *
+ * THREE, not four: an ARM EABI vtable for a multiple-inheritance class starts
+ * with two non-code words (offset-to-top and the typeinfo pointer), and a
+ * short class can have exactly three virtual entries after that header. That
+ * is the shape MLB 15 uses for its olSocial* classes, and at four entries the
+ * adjustor thunks in them were rejected: they begin with `sub.w r0, r0, #n`
+ * rather than a push, so they need the table to vouch for them. Missing one
+ * is not a cosmetic gap — the first virtual call on the object stops the
+ * program (0x81C4AFE9 here). At three words the odds are still about 1 in
+ * 10^10 per position; a handful of false positives across a 15 MB image is
+ * possible, and each costs one dispatch slot, not correctness. */
+#define SHAPE_RUN_MIN 3
+
+/* A gap this large between reliable function starts is not code (see vf_discover). */
+#define CODE_GAP (256u * 1024u)
+
+static int u32_cmp(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static uint32_t shape_run_len(const vm_image *img, const uint8_t *scan,
+                              uint32_t scan_len, uint32_t off) {
+    uint32_t n = 0, t;
+    while (off + 4 <= scan_len && code_ptr_shape(img, scan + off, &t)) {
+        n++;
+        off += 4;
+    }
+    return n;
+}
+
+/* Does `t` start right after the end of a function: padding, a return or an
+ * unconditional branch just before it, and something decodable at it? A
+ * function begins where the previous one stops; a pointer into rodata almost
+ * never lands on such a spot. */
+static int after_function_end(const uint8_t *text, uint32_t base, uint32_t len, uint32_t t) {
+    if (t < base + 4 || t + 2 > base + len) return 0;
+    int end = 0;
+    /* k = 0: right after the previous function. k > 0: after a literal pool
+     * of k words that follows it (pools are word-aligned; 0x8158D524 sits
+     * after one word of 0x66666666 that follows a `nop` of padding). */
+    for (uint32_t k = 0; k <= 16 && !end; k++) {
+        uint32_t p = t - 4 * k;
+        if (k && (p & 3)) p &= ~3u;
+        if (p < base + 4) break;
+        arm_insn pv;
+        uint32_t at = p - base;
+        uint16_t p16 = (uint16_t)(text[at - 2] | ((uint16_t)text[at - 1] << 8));
+        end = p16 == 0xBF00 || (k == 0 && p16 == 0x0000);             /* padding */
+        if (!end && arm_decode(text, base, len, p - 2, ARM_T32, &pv) == 2)
+            end = pv.cls == A_RETURN || (pv.cls == A_BRANCH && !pv.conditional);
+        if (!end && arm_decode(text, base, len, p - 4, ARM_T32, &pv) == 4)
+            end = pv.cls == A_RETURN || (pv.cls == A_BRANCH && !pv.conditional);
+    }
+    arm_insn first;
+    return end && arm_decode(text, base, len, t, ARM_T32, &first) &&
+           first.cls != A_UNKNOWN && first.cls != A_UNDEF;
+}
+
+/* Sweep one region for words that look like pointers INTO the executable
+ * segment. The region being scanned and the region being pointed at are two
+ * different things: candidates come from wherever the module stores pointers,
+ * but a valid target is always code. */
+static uint32_t shape_scan_region(const vm_image *img, vf_result *r, seedq *q,
+                                  const uint8_t *scan, uint32_t scan_len) {
+    const uint8_t *text = img->data + img->seg_file;
+    const uint32_t base = img->seg_vaddr;
+    const uint32_t len  = img->seg_len;
+    uint32_t found = 0;
+    uint32_t run_left = 0;      /* words remaining in the current table */
+
+    for (uint32_t off = 0; off + 4 <= scan_len; off += 4) {
+        uint32_t t;
+
+        /* Only measure when not already inside a table, so a long run costs
+         * one measurement rather than one per entry. A run too short to
+         * qualify is at most SHAPE_RUN_MIN words, so re-measuring across it is
+         * bounded and cheap. */
+        if (run_left == 0) {
+            uint32_t n = shape_run_len(img, scan, scan_len, off);
+            if (n >= SHAPE_RUN_MIN) run_left = n;
+        }
+        int in_table = run_left > 0;
+        if (run_left) run_left--;
+
+        if (!code_ptr_shape(img, scan + off, &t)) continue;
+
+        /* Already decoded as part of another function's walk: still an ENTRY.
+         * A Thumb-tagged pointer that lands exactly on a decoded instruction
+         * start is the strongest evidence this heuristic ever gets, and
+         * skipping it left 206 of one title's 1,461 static constructors out of
+         * the dispatch table — each a trap when the startup code calls it. */
+        if (seen_get(r, t - base)) {
+            sq_push(q, t, ARM_T32, 1);
+            r->seeds_shape++;
+            found++;
+            continue;
+        }
+
+        arm_insn in;
+        if (arm_decode(text, base, len, t, ARM_T32, &in) == 0) { r->rejected_shape++; continue; }
+        if (in.cls == A_UNKNOWN || in.cls == A_UNDEF) { r->rejected_shape++; continue; }
+
+        /* "Decodes as something" is far too weak a filter to be worth much:
+         * the Thumb decoder almost never returns unknown, so nearly every
+         * candidate passes and the heuristic degenerates into "any word with
+         * bit 0 set that points into .text". In several megabytes of data that
+         * is mostly coincidence.
+         *
+         * Requiring a function PROLOGUE is a real filter. Compiled Thumb
+         * functions overwhelmingly begin by pushing registers — PUSH (0xB4xx /
+         * 0xB5xx) or PUSH.W / STMDB (0xE92D). A leaf function that pushes
+         * nothing will be missed, which is why the two tiers are counted and
+         * reported separately rather than merged into one number.
+         *
+         * INSIDE A TABLE the filter is not just unnecessary, it is wrong. A
+         * word in a run has already been established as a pointer by its
+         * neighbours, so demanding a prologue of it only throws away the
+         * functions that genuinely lack one. On this corpus's first title that
+         * is 47 of the 551 static constructors, and they are exactly the kind
+         * you would expect: leaves that start with `movw` because they store a
+         * constant and save nothing, and one that is a bare `bx lr`. Each one
+         * missed is a run-time trap in a table the program walks at startup.
+         *
+         * Aceptamos también `bx lr` (0x4770) como prólogo válido para cubrir
+         * los stubs nulos de tablas virtuales (vtable thunks) que el juego
+         * usa mucho y no empujan registros.
+         */
+        uint16_t h = (uint16_t)(text[t - base] | ((uint16_t)text[t - base + 1] << 8));
+        int prologue = ((h & 0xFE00) == 0xB400)          /* push            */
+                    || (h == 0xE92D)                     /* push.w / stmdb  */
+                    || ((h & 0xFF80) == 0xB080)          /* sub sp, #imm    */
+                    || (h == 0x4770);                    /* bx lr           */
+
+        /* A lone pointer to a leaf with no prologue (`movs r0, #0; bx lr` in a
+         * table of {name, handler} records: 0x8158D525) is accepted when it
+         * lands right after the end of the previous function. */
+        if (!prologue && !in_table && !after_function_end(text, base, len, t)) { r->rejected_shape++; continue; }
+
+        sq_push(q, t, ARM_T32, 1);
+        r->seeds_shape++;
+        found++;
+    }
+    return found;
+}
+
+/* --- movw/movt address construction ---------------------------------------- */
+/*
+ * A function whose address is only ever COMPUTED leaves no pointer word
+ * anywhere for the shape sweep to find. Three of them stopped MLB 15 during
+ * start-up:
+ *
+ *   0x810323A4  the GXM display-queue callback. The game writes it into a
+ *               SceGxmInitializeParams that it builds on the STACK, so the
+ *               pointer never exists in .text or in a data segment.
+ *   0x810313DC  the "Display Engine" thread entry, passed as an argument to
+ *               sceKernelCreateThread.
+ *   0x8100AF4A  a front-end helper reached through a C++ member pointer. It
+ *               begins with movw/movt itself (loads a global), so it has no
+ *               prologue to recognise either.
+ *
+ * They are materialised as a movw/movt pair, which is how a compiler builds a
+ * 32-bit address without a relocation. This pass collects every such pair and
+ * seeds a target when there is evidence that it is code:
+ *
+ *   - it starts with a prologue (push / sub sp), or
+ *   - two or more INDEPENDENT sites materialise the same address.
+ *
+ * The second rule is what finds 0x8100AF4A: twenty-odd call sites form its
+ * address, but it starts with `movw r1, #...`, which no prologue test accepts.
+ * A single reference without a prologue is still rejected — movw/movt is also
+ * how a compiler forms the address of a constant, and .text holds its own
+ * literal pools and strings — and a multi-reference candidate must decode as
+ * at least a few Thumb instructions before it is believed.
+ *
+ * Targets are accepted with or without the Thumb bit: a function symbol is
+ * commonly stored even and or-ed with 1 at the call site.
+ */
+static uint32_t scan_movw_movt(const vm_image *img, vf_result *r, seedq *q) {
+    const uint8_t *text = img->data + img->seg_file;
+    const uint32_t base = img->seg_vaddr;
+    const uint32_t len  = img->seg_len;
+
+    #define MOVW_CAND 65536
+    struct cand { uint32_t addr, count; uint8_t prologue, thumb; };
+    static struct cand cand[MOVW_CAND];
+    memset(cand, 0, sizeof(cand));
+
+    uint32_t lo[16] = {0};
+    uint32_t lo_at[16] = {0};
+    uint8_t  have[16] = {0};
+    uint32_t found = 0;
+
+    for (uint32_t off = 0; off + 4 <= len; ) {
+        arm_insn in;
+        /* Se avanza de media palabra en media palabra, PERO si la instruccion
+         * decodificada tiene ancho 4, la siguiente media palabra es la segunda
+         * mitad de esa misma instruccion y NO debe decodificarse como inicio.
+         * Saltarla evita que un movw/movt parcial se registre como escritura
+         * al mismo registro y borre el par pendiente. */
+        int ok_dec = arm_decode(text, base, len, base + off, ARM_T32, &in);
+        if (!ok_dec) { off += 2; continue; }
+
+        uint32_t next_off = off + (in.width == 4 ? 4 : 2);
+
+        if (in.cls == A_ALU && in.has_imm && in.rd >= 0 && in.rd < 16) {
+            int is_movw = (in.width == 4 && in.op == OP_MOV &&
+                           in.mnemonic && strcmp(in.mnemonic, "movw") == 0);
+            if (is_movw) {
+                lo[in.rd] = in.imm & 0xFFFFu;
+                lo_at[in.rd] = base + off;
+                have[in.rd] = 1;
+            } else if (in.width == 4 && in.op == OP_MOVT) {
+                /* Two instructions apart at most in practice, but a compiler
+                 * will happily interleave stores to the stack between them:
+                 * MLB 15 builds 0x8164B97F with the movw and movt 22 bytes
+                 * apart (strd/strd/ldr in between). 64 bytes covers that and
+                 * stays safe because ANY other write to the same register
+                 * clears the pending low half below. */
+                if (have[in.rd] && (base + off) - lo_at[in.rd] <= 64) {
+                    uint32_t v = (in.imm << 16) | lo[in.rd];
+                    uint32_t t = v & ~1u;
+                    if (t >= base && t + 2 <= base + len && ((t - base) & 1u) == 0) {
+                        uint32_t toff = t - base;
+                        uint16_t h = (uint16_t)(text[toff] | ((uint16_t)text[toff + 1] << 8));
+                        int prologue = ((h & 0xFE00) == 0xB400)   /* push          */
+                                    || (h == 0xE92D)              /* push.w/stmdb  */
+                                    || ((h & 0xFF80) == 0xB080);  /* sub sp, #imm  */
+                        /* Insertar en la tabla de candidatos. */
+                        uint32_t slot = (t * 2654435761u >> 16) & (MOVW_CAND - 1);
+                        for (int probe = 0; probe < 16; probe++) {
+                            uint32_t i = (slot + (uint32_t)probe) & (MOVW_CAND - 1);
+                            if (cand[i].addr == 0 || cand[i].addr == t) {
+                                cand[i].addr = t;
+                                cand[i].count++;
+                                cand[i].prologue |= (uint8_t)prologue;
+                                cand[i].thumb |= (uint8_t)(v & 1u);
+                                break;
+                            }
+                        }
+                    }
+                }
+                /* No se borra `have[rd]`: con el avance de media palabra, la
+                 * segunda mitad de un movw puede decodificarse como una
+                 * escritura al mismo registro y borraria un par valido. La
+                 * distancia maxima y el que la direccion combinada caiga
+                 * dentro de .text ya filtran los pares falsos. */
+            }
+        }
+        off = next_off;
+    }
+
+    for (int i = 0; i < MOVW_CAND; i++) {
+        uint32_t t = cand[i].addr;
+        if (!t) continue;
+        int ok = cand[i].prologue != 0;
+        if (!ok && cand[i].count >= 2) {
+            uint32_t off = t - base;
+            ok = 1;
+            for (int k = 0; k < 3; k++) {
+                arm_insn in;
+                if (off + 2 > len || arm_decode(text, base, len, base + off, ARM_T32, &in) == 0) {
+                    ok = 0;
+                    break;
+                }
+                if (in.cls == A_RETURN) break;
+                off += in.width ? in.width : 2;
+            }
+        }
+        /* One reference is enough for a callback (a qsort comparator, a
+         * handler registered once) when the value carries the Thumb bit AND
+         * the instruction right before the target ends a function: a function
+         * begins where the previous one stops. A pointer into rodata almost
+         * never satisfies both. MLB 15's first one was 0x813D7029, a leaf
+         * comparator with no prologue, reached only through qsort. */
+        if (!ok && cand[i].thumb && t >= base + 4) {
+            if (after_function_end(text, base, len, t)) ok = 1;
+            /* A literal pool between functions hides the previous one's
+             * return (0x8101D339 sits after one). Then: decoding forward must
+             * reach a return within 64 instructions through nothing
+             * undecodable — text almost never reads as that. */
+            if (!ok) {
+                uint32_t o2 = t - base;
+                for (int k = 0; k < 64 && o2 + 2 <= len; k++) {
+                    arm_insn w;
+                    int n = arm_decode(text, base, len, base + o2, ARM_T32, &w);
+                    if (!n || w.cls == A_UNKNOWN || w.cls == A_UNDEF) break;
+                    if (w.cls == A_RETURN) { ok = 1; break; }
+                    if (w.cls == A_BRANCH && !w.conditional) break;
+                    o2 += (uint32_t)n;
+                }
+            }
+        }
+        if (ok) {
+            sq_push(q, t, ARM_T32, 1);
+            r->seeds_movw++;
+            found++;
+        }
+    }
+    return found;
+}
+
+static void shape_scan(const vm_image *img, vf_result *r, seedq *q) {
+    shape_scan_region(img, r, q, img->data + img->seg_file, img->seg_len);
+
+    /* The data segments, which is where a C++ module keeps the table of
+     * static constructors. Nothing in .text points at them: the only reference
+     * to a constructor is its slot in that table, so a sweep of the executable
+     * segment alone finds none of them — on this corpus's first title, all 551,
+     * including the module's very first function.
+     *
+     * Counted separately from the .text sweep. They are the same heuristic run
+     * over different bytes, but a table of pointers is a much richer place to
+     * find pointers than a code segment is, and merging the two numbers would
+     * hide which one is doing the work. */
+    for (uint32_t i = 0; i < img->data_seg_count; i++) {
+        const vm_seg *s = &img->data_segs[i];
+        if ((uint64_t)s->file + s->len > img->size) continue;
+        r->seeds_shape_data +=
+            shape_scan_region(img, r, q, img->data + s->file, s->len);
+    }
+}
+
+/* Barrido de prólogos: funciones que nadie llama directamente y cuya dirección
+ * solo se construye en registros (p. ej. `movw r2, #0x9be5` ... `movt r1,
+ * #0x81af`, en registros distintos, que scan_movw_movt no empareja). En el
+ * código que ningún recorrido ha decodificado, un `push {..., lr}` justo tras
+ * el final de otra función es el principio de una función: 0x81AF9BE4 de MLB 15,
+ * a la que el juego salta al empezar el partido. Solo hasta `code_end`. */
+static uint32_t prologue_scan(const vm_image *img, vf_result *r, seedq *q, uint32_t code_end) {
+    const uint8_t *text = img->data + img->seg_file;
+    const uint32_t base = img->seg_vaddr;
+    const uint32_t len  = img->seg_len;
+    uint32_t found = 0;
+    for (uint32_t off = 4; off + 4 <= len && base + off < code_end; off += 2) {
+        if (seen_get(r, off)) continue;
+        uint16_t h = (uint16_t)(text[off] | ((uint16_t)text[off + 1] << 8));
+        uint16_t h2 = (uint16_t)(text[off + 2] | ((uint16_t)text[off + 3] << 8));
+        int push_lr = (h & 0xFF00) == 0xB500                       /* push {..., lr}   */
+                   || (h == 0xE92D && (h2 & 0x4000) && !(h2 & 0xA000)); /* push.w con lr, sin pc/sp */
+        if (!push_lr) continue;
+        if (!after_function_end(text, base, len, base + off)) continue;
+        sq_push(q, base + off, ARM_T32, 1);
+        r->seeds_shape++;
+        found++;
+    }
+    return found;
+}
+
+/* Barrido de stubs: busca runs de 'bx lr' (0x4770) consecutivos en .text.
+ * Las vtables de MLB 15 contienen secuencias de stubs nulos (bx lr) separados
+ * 2 bytes, y el primer stub de la secuencia no tiene puntero estático que lo
+ * apunte porque la vtable se parchea en tiempo de ejecución. */
+static uint32_t stub_scan(const vm_image *img, vf_result *r, seedq *q) {
+    const uint8_t *text = img->data + img->seg_file;
+    const uint32_t base = img->seg_vaddr;
+    const uint32_t len  = img->seg_len;
+    uint32_t found = 0;
+
+
+    for (uint32_t off = 0; off + 2 <= len; off += 2) {
+        uint16_t h = (uint16_t)(text[off] | ((uint16_t)text[off + 1] << 8));
+        if (h != 0x4770) continue;  /* bx lr */
+
+        /* Medir cuántos bx lr consecutivos hay a partir de aquí. */
+        uint32_t run = 1;
+        /* `run` cuenta instrucciones, y cada una ocupa 2 bytes. Medirlo en
+         * bytes leía 0x7047 (la mitad de un bx lr y la de otro): el run
+         * siempre valía 1 y este barrido no sembraba nada. */
+        while (off + run * 2 + 2 <= len) {
+            uint16_t h2 = (uint16_t)(text[off + run * 2] | ((uint16_t)text[off + run * 2 + 1] << 8));
+            if (h2 != 0x4770) break;
+            run++;
+        }
+
+
+        if (run >= 3) {  /* run de 3+ bx lr = tabla de stubs nulos */
+            for (uint32_t i = 0; i < run; i++) {
+                uint32_t t = base + off + i * 2;
+                /* Aunque otro recorrido ya lo haya decodificado: decodificado no
+                 * es registrado como función, y un thunk de vtable se llama por
+                 * puntero. FN_TEST evita duplicados al sacar la semilla. */
+                {
+                    sq_push(q, t, ARM_T32, 1);
+                    r->seeds_shape++;  /* contamos como shape para estadísticas */
+                    found++;
+                }
+            }
+            off += (run - 1) * 2;  /* saltar el resto del run */
+        }
+    }
+    return found;
+}
+
+/* --- entry point ------------------------------------------------------------ */
+
+int vf_discover(const vm_image *img, const vm_module *mod, vf_result *out) {
+    memset(out, 0, sizeof(*out));
+
+    out->seen_bytes = (img->seg_len / 2 + 7) / 8 + 1;
+    out->seen = (uint8_t *)calloc(out->seen_bytes, 1);
+    if (!out->seen) return 1;
+
+    seedq q = {0};
+    const uint32_t base = img->seg_vaddr;
+
+    /* 1. module_start. The offset carries no Thumb bit, and the corpus is
+     *    overwhelmingly Thumb, so it is seeded as Thumb. */
+    if (mod->have_info && mod->info.module_start != 0xFFFFFFFF) {
+        sq_push(&q, base + (mod->info.module_start & 0x3FFFFFFF), ARM_T32, 0);
+        out->seeds_entry++;
+    }
+
+    /* 2. Export entry tables. Each export names a real function. */
+    if (mod->have_info) {
+        uint32_t p = mod->info.export_top;
+        while (p + 0x20 <= mod->info.export_end) {
+            const uint8_t *e = vm_ptr(img, p, 0x20);
+            if (!e) break;
+            uint16_t size  = (uint16_t)(e[0] | (e[1] << 8));
+            uint16_t nfunc = (uint16_t)(e[6] | (e[7] << 8));
+            uint32_t etab  = (uint32_t)e[0x1C] | ((uint32_t)e[0x1D] << 8)
+                           | ((uint32_t)e[0x1E] << 16) | ((uint32_t)e[0x1F] << 24);
+            if (size < 0x20) break;
+
+            const uint8_t *t = vm_va(img, etab, (uint32_t)nfunc * 4);
+            for (uint32_t i = 0; t && i < nfunc; i++) {
+                uint32_t v = (uint32_t)t[i*4] | ((uint32_t)t[i*4+1] << 8)
+                           | ((uint32_t)t[i*4+2] << 16) | ((uint32_t)t[i*4+3] << 24);
+                if (v < base || v >= base + img->seg_len) continue;
+                sq_push(&q, v & ~1u, (v & 1) ? ARM_T32 : ARM_A32, 0);
+                out->seeds_export++;
+            }
+            p += size;
+        }
+    }
+
+    /* 3. Linear harvest of call targets. Recursive descent alone stalls almost
+     *    immediately — the same lesson psprecomp learned when descent from the
+     *    entry point found 47 instructions. */
+    {
+        const uint8_t *text = img->data + img->seg_file;
+        for (uint32_t off = 0; off + 4 <= img->seg_len; off += 2) {
+            arm_insn in;
+            /* Only at an instruction boundary. Read from its second halfword,
+             * a 32-bit instruction followed by another can decode as a BL to
+             * anywhere: `bl` at 0x81BECADC read from 0x81BECADE "called"
+             * 0x8186CC98, the middle of zlib's longest_match loop. As a sure
+             * start it split the loop into functions that call each other once
+             * per iteration, and the native stack overflowed.
+             *
+             * The rule is exact in code: count the 32-bit prefix halfwords
+             * (0b11101/0b11110/0b11111) right before `off`. The halfword before
+             * that run is not a prefix, so it ends an instruction (a 16-bit one
+             * or a second half); inside the run prefixes pair up as first and
+             * second halves, so `off` starts an instruction iff the count is even. */
+            uint32_t m = 0;
+            while (m * 2 + 2 <= off) {
+                uint32_t p = off - m * 2 - 2;
+                uint16_t h = (uint16_t)(text[p] | ((uint16_t)text[p + 1] << 8));
+                if ((h >> 11) < 0x1D) break;
+                m++;
+            }
+            if (m & 1) continue;
+            if (arm_decode(text, base, img->seg_len, base + off, ARM_T32, &in) == 0) continue;
+            if (in.cls == A_CALL && in.has_target &&
+                in.target >= base && in.target < base + img->seg_len) {
+                /* Same rule as the descent above. This sweep decodes every
+                 * halfword of .text including its data, so it is the site that
+                 * manufactures bogus mode switches in bulk. */
+                if (in.switches_mode && !arm_seed_ok(mod, in.target)) {
+                    out->seeds_arm_refused++;
+                    continue;
+                }
+                sq_push(&q, in.target, in.switches_mode ? ARM_A32 : ARM_T32, 0);
+            }
+        }
+    }
+
+    /* 3b. Addresses built with movw/movt. Deliberately here, before the main
+     *     walk: seeds pushed after `head` has passed them are never visited. */
+    scan_movw_movt(img, out, &q);
+
+    /* Where the code ends. The tail of the executable segment is read-only
+     * data, and tables of pointers to strings there have the shape of Thumb
+     * pointer tables whenever the strings sit at odd addresses. Walked as code
+     * they produced 8,800 "functions" in MLB 15's rodata and 19 M bogus
+     * instructions (the image no longer linked). Reliable starts — call
+     * targets and exports — are dense through real code, so the code ends
+     * before the first large gap between them. Thumb seeds past it are
+     * dropped, reliable ones too: a walk that runs off the end of a function
+     * into data decodes junk BLs there, and each "call target" in data walked
+     * more data (0x81E2F782 is referenced by nothing). The import stubs at the
+     * very end are ARM code and are not affected. */
+    uint32_t code_end = base + img->seg_len;
+    {
+        uint32_t ns = 0;
+        uint32_t *sv = (uint32_t *)malloc((q.n + 1) * sizeof(uint32_t));
+        if (sv) {
+            for (uint32_t i = 0; i < q.n; i++)
+                if (!q.v[i].heur && q.v[i].addr >= base && q.v[i].addr < base + img->seg_len)
+                    sv[ns++] = q.v[i].addr;
+            sv[ns++] = base + img->seg_len;   /* the segment end closes the last gap */
+            qsort(sv, ns, sizeof(uint32_t), u32_cmp);
+            for (uint32_t i = 1; i < ns; i++)
+                if (sv[i] - sv[i - 1] > CODE_GAP) { code_end = sv[i - 1] + CODE_GAP; break; }
+            free(sv);
+        }
+    }
+
+    /* A separate registry of function ENTRIES, distinct from the map of decoded
+     * instructions.
+     *
+     * These must not be conflated. `seen` records "an instruction was decoded
+     * here" and exists to stop the walk repeating work. Whether an address is a
+     * FUNCTION is a different question, and the answer is yes whenever
+     * something calls it — even if another function's flow walk happened to
+     * wander through it first, which is common where code falls through into
+     * what is also a call target.
+     *
+     * Gating registration on `seen` meant such addresses were never registered,
+     * while the emitter still emitted calls to them: the generated C compiled
+     * and then failed to link, naming symbols that were never defined. */
+    uint8_t *fseen = (uint8_t *)calloc(out->seen_bytes, 1);
+    if (!fseen) { free(q.v); return 1; }
+
+    #define FN_MARK(a) (fseen[(((a) - base) >> 1) >> 3] |= (uint8_t)(1u << ((((a) - base) >> 1) & 7)))
+    #define FN_TEST(a) ((fseen[(((a) - base) >> 1) >> 3] >> ((((a) - base) >> 1) & 7)) & 1)
+
+    uint32_t head = 0;
+    while (head < q.n) {
+        seed s = q.v[head++];
+        if (s.addr < base || s.addr >= base + img->seg_len) continue;
+        if (s.addr >= code_end && s.mode == ARM_T32) { out->rejected_shape++; continue; }
+        if (FN_TEST(s.addr)) continue;
+
+        FN_MARK(s.addr);
+        add_func(out, s.addr, s.mode, s.heur);
+        walk(img, mod, out, &q, s.addr, s.mode, &out->funcs[out->count - 1]);
+    }
+
+    /* 4. Shape recovery, after everything principled has been exhausted, so it
+     *    only ever adds what the reliable seeds could not reach. */
+    uint32_t before = q.n;
+    shape_scan(img, out, &q);
+
+    /* 4b. Stub scan: runs de bx lr en .text que la shape scan no ve por falta
+     * de punteros estáticos (vtables parcheadas en runtime). */
+    stub_scan(img, out, &q);
+
+    /* 4c. Prólogos que nadie alcanzó (direcciones construidas en registros). */
+    prologue_scan(img, out, &q, code_end);
+
+    head = before;
+    while (head < q.n) {
+        seed s = q.v[head++];
+        if (s.addr < base || s.addr >= base + img->seg_len) continue;
+        if (s.addr >= code_end && s.mode == ARM_T32) { out->rejected_shape++; continue; }
+        if (FN_TEST(s.addr)) continue;
+
+        FN_MARK(s.addr);
+        add_func(out, s.addr, s.mode, s.heur);
+        walk(img, mod, out, &q, s.addr, s.mode, &out->funcs[out->count - 1]);
+    }
+
+    #undef FN_MARK
+    #undef FN_TEST
+
+    free(fseen);
+    free(q.v);
+    return 0;
+}
+
+void vf_free(vf_result *r) {
+    free(r->funcs);
+    free(r->seen);
+    memset(r, 0, sizeof(*r));
+}

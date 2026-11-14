@@ -1,0 +1,52 @@
+// Project Baseball para Android (port nativo de MLB 15 The Show; no lleva nada del juego).
+apply plugin: 'com.android.application'
+
+android {
+    namespace "org.libsdl.app"          // paquete de las clases Java de SDL2 (SDLActivity)
+    compileSdkVersion 34
+    ndkVersion "27.2.12479018"
+    defaultConfig {
+        applicationId "com.projectbaseball.app"
+        minSdkVersion 29                 // Android 10: TLS ELF nativa (con 26 el NDK emula la TLS, lentÃ­simo)
+        targetSdkVersion 34
+        versionCode 1
+        versionName "0.1.0"
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_shared", "-DANDROID_PLATFORM=android-29", "-DCMAKE_BUILD_TYPE=Release"
+                abiFilters 'arm64-v8a'   // solo 64 bits: los mÃ³viles nuevos ya no ejecutan ARM de 32 bits
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+    applicationVariants.all { variant ->
+        tasks["merge${variant.name.capitalize()}Assets"]
+            .dependsOn("externalNativeBuild${variant.name.capitalize()}")
+    }
+    sourceSets.main {
+        jniLibs.srcDir 'libs'
+    }
+    externalNativeBuild {
+        cmake {
+            path 'jni/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+    lint {
+        abortOnError false
+    }
+    buildFeatures {
+        prefab true   // Swappy (Android Frame Pacing) llega como paquete Prefab
+    }
+}
+
+dependencies {
+    // Android Frame Pacing (AGDK): presentar cada fotograma a tiempo para su refresco sin llenar la cola
+    // (30 FPS sin tirones y sin retraso en los botones)
+    implementation "androidx.games:games-frame-pacing:2.1.3"
+}
