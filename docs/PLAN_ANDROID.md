@@ -427,6 +427,33 @@ capturas con `fuente\capturas_partido.py` + `hoja_capturas.py`). Con `PB_FB_MEMO
 - **Resultado** (x1,5, público de cartón, partido con guion 3 min): **0 escenas llenas, tirones visibles 0,77 %**,
   56 °C, toma de entrada con estadio y cielo. Memoria del juego ~1,06 GB.
 
+### Generar libjuego.so dentro del teléfono (2026-11-14, en curso)
+
+Para que la APK sirva sin PC (y sin repartir nada del juego): la app prepara `libjuego.so` la primera vez, como el
+launcher de PC.
+- `PreparacionActivity` (pantalla «Preparando el juego», ES/EN, barra de progreso): copia `assets/generador` a
+  `files/generador`, `libarmrecomp.so emit eboot.elf` -> `juego.c` (~480 MB), `libpartir.so` (trozos de 12 MB; es
+  la parte de partir/corregir de `recompilar.c` sacada a `fuente/android/movil/partir.c`), `libclang.so` en
+  paralelo (núcleos-1, ~1,3 GB de memoria libre por clang, máx. 6; borra cada trozo al compilarlo), `liblld.so`
+  contra `libmain.so` de la app. Deja `libjuego.so` + `libjuego.txt` (huella: tamaño y CRC del eboot + versionCode)
+  en `ProjectBaseball/`. Pico ~1,1 GB en `files/gen`, se borra al acabar.
+- `OpcionesActivity`: si hay `eboot.elf` y falta `libjuego.so` (o la huella no coincide) -> «el juego se preparará al
+  tocar JUGAR» y JUGAR abre la preparación. Una `libjuego.so` puesta a mano sin huella se respeta.
+- Herramientas como `lib*.so` en `app/libs/arm64-v8a` (Android solo deja ejecutar lo que viene en la APK;
+  `extractNativeLibs="true"`). `fuente/preparar_generador.ps1` las compila/copia: armrecomp y partir con el NDK,
+  clang y lld de LLVM 19.1.7 para Android (`fuente/llvm_host.cmd` = tblgen para Windows,
+  `fuente/llvm_android.cmd` = clang+lld ARM64, solo AArch64, libc++ estática).
+- **Medido en el S22 por adb** (`fuente/android/movil/preparar_prueba.sh`): armrecomp 5 s (C 417 MB), partir 3 s
+  (35 trozos), clang 6 a la vez 1 494 s, lld 2 s: **25 min**, libjuego.so 134 MB, batería 42,7 °C. Esa libjuego.so
+  juega igual que la del PC (30 FPS, 0,86 % de tirones, 0 trampas). clang usa 400-520 MB por trozo (el cálculo de
+  hilos va con 700 MB). clang 85,5 MB y lld 45,3 MB; **APK con el generador: 54,5 MB**.
+- **Probado desde la app (de principio a fin)**: sin libjuego.so, opciones -> «○ el juego se preparará al tocar
+  JUGAR» -> JUGAR -> «Preparando el juego» (4 clang a la vez: el cálculo da 4 con ~3 GB libres) -> **«Listo,
+  preparado en 26 min 5 s»**, libjuego.so + libjuego.txt en ProjectBaseball/. Partido con esa libjuego.so: 30 FPS,
+  0,90 % de tirones, 0 trampas. Opciones: «✓ juego preparado».
+- Respaldos en el teléfono: `libjuego_pc.so` (la de siempre) y `libjuego_movil.so` (la de la prueba por adb).
+- Pendiente: sacar el eboot de la carpeta de Vita3K (eboot.bin) sin PC; acortar los 25 min (¿-O1 en trozos fríos?).
+
 ## Siguiente paso inmediato (antes de esto)
 
 1. Versiones Android de los diálogos (`fuente\android\dialogos_android.c`): misma lógica que

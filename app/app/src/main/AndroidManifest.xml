@@ -96,6 +96,13 @@
             </intent-filter>
         </activity>
 
+        <!-- Preparar el juego: genera libjuego.so dentro del teléfono (PreparacionActivity.java) -->
+        <activity android:name="PreparacionActivity"
+            android:label="@string/app_name"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+            android:exported="false" />
         <activity android:name="ProjectBaseballActivity"
             android:label="@string/app_name"
             android:alwaysRetainTaskState="true"

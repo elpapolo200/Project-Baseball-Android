@@ -47,6 +47,22 @@ public class OpcionesActivity extends Activity {
     private int res, fps, brillo, nitidez, tamBotones, opacidad, zoom, publico;
     private boolean verFps, verTemp, suavizado, sombras, jugAlta, botones;
     private static boolean en;   /* textos en inglés ([android] idioma=en) */
+    private static final int ELEGIR_EBOOT = 7;
+    private Button botonEboot;
+
+    /* eboot.bin elegido: convertirlo a ProjectBaseball/eboot.elf (o copiarlo si ya es un ELF) */
+    @Override
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req != ELEGIR_EBOOT || res != RESULT_OK || data == null || data.getData() == null) return;
+        String e;
+        try (java.io.InputStream in = getContentResolver().openInputStream(data.getData())) {
+            new File(Ini.CARPETA).mkdirs();
+            e = Eboot.aElf(Eboot.leer(in), new File(Ini.CARPETA + "/eboot.elf"), en);
+        } catch (Exception ex) { e = ex.toString(); }
+        Toast.makeText(this, e == null ? t("eboot listo", "eboot ready") : e, Toast.LENGTH_LONG).show();
+        construir();
+    }
 
     /* Idioma de la app: [android] idioma = es (por defecto) / en (selector «Idioma / Language»). */
     static boolean ingles(Ini ini) {
@@ -144,6 +160,20 @@ public class OpcionesActivity extends Activity {
         LinearLayout.LayoutParams lpE = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         lpE.topMargin = dp(14);
         raiz.addView(estado, lpE);
+        /* elegir el eboot.bin descifrado (p. ej. el de Vita3K) con el selector de archivos de Android */
+        botonEboot = new Button(this);
+        botonEboot.setText(t("Elegir eboot.bin", "Choose eboot.bin")); botonEboot.setAllCaps(false); botonEboot.setTextColor(Color.WHITE);
+        botonEboot.setBackground(fondo(ACENTO, 10));
+        botonEboot.setOnClickListener(v -> {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            try { startActivityForResult(i, ELEGIR_EBOOT); }
+            catch (Exception e) { Toast.makeText(this, e.toString(), Toast.LENGTH_LONG).show(); }
+        });
+        LinearLayout.LayoutParams lpB = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44));
+        lpB.topMargin = dp(8);
+        raiz.addView(botonEboot, lpB);
         comprobar();
 
         /* dos columnas */
@@ -329,9 +359,28 @@ public class OpcionesActivity extends Activity {
         sb.append(arcOk ? (claro ? t("✓ Carpeta del juego (PCSA00511)", "✓ Game folder (PCSA00511)") : t("✗ PCSA00511 está CIFRADA (usa la de Vita3K)", "✗ PCSA00511 is ENCRYPTED (use the Vita3K one)")) : t("✗ Falta la carpeta PCSA00511", "✗ PCSA00511 folder missing"));
         todo &= arcOk && claro;
         File elf = new File(Ini.CARPETA + "/eboot.elf");
-        sb.append(elf.length() > 1000000 ? t("     ✓ eboot.elf", "     ✓ eboot.elf") : t("     ✗ falta eboot.elf", "     ✗ eboot.elf missing")); todo &= elf.length() > 1000000;
-        File so = new File(Ini.CARPETA + "/libjuego.so");
-        sb.append(so.length() > 1000000 ? t("     ✓ libjuego.so", "     ✓ libjuego.so") : t("     ✗ falta libjuego.so", "     ✗ libjuego.so missing")); todo &= so.length() > 1000000;
+        String nota = null;
+        if (elf.length() <= 1000000) {   /* sin eboot.elf: convertir un eboot.bin descifrado si está a mano */
+            File bin = Eboot.buscar();
+            if (bin != null) {
+                try (FileInputStream in = new FileInputStream(bin)) {
+                    String e = Eboot.aElf(Eboot.leer(in), elf, en);
+                    nota = e == null ? t("     ✓ eboot (convertido de " + bin.getName() + ")", "     ✓ eboot (converted from " + bin.getName() + ")") : "     ✗ " + e;
+                } catch (Exception ex) { nota = "     ✗ " + ex; }
+            } else if (Eboot.cifrado() != null)
+                nota = t("     ✗ el eboot.bin está CIFRADO: toca «Elegir eboot.bin» y elige el descifrado de Vita3K",
+                         "     ✗ eboot.bin is ENCRYPTED: tap \"Choose eboot.bin\" and pick the decrypted one from Vita3K");
+        }
+        boolean elfOk = elf.length() > 1000000;
+        sb.append(nota != null && elfOk ? nota : elfOk ? t("     ✓ eboot.elf", "     ✓ eboot.elf")
+                  : nota != null ? nota : t("     ✗ falta el eboot: toca «Elegir eboot.bin»", "     ✗ eboot missing: tap \"Choose eboot.bin\""));
+        todo &= elfOk;
+        if (botonEboot != null) botonEboot.setVisibility(elfOk ? View.GONE : View.VISIBLE);
+        /* libjuego.so (el juego traducido): si falta o es de otro eboot / otra versión, la app la prepara al tocar JUGAR */
+        if (!elfOk) { /* sin eboot no hay nada que preparar todavía */ }
+        else if (PreparacionActivity.faltaPreparar(this))
+            sb.append(t("     ○ el juego se preparará al tocar JUGAR (solo la primera vez)", "     ○ the game will be prepared when you tap PLAY (first time only)"));
+        else sb.append(t("     ✓ juego preparado", "     ✓ game prepared"));
         if (!todo) sb.append(t("\nTodo va en la memoria interna, carpeta ProjectBaseball (junto a Download, DCIM...).", "\nEverything goes in internal storage, ProjectBaseball folder (next to Download, DCIM...)."));
         estado.setText(sb.toString());
         estado.setTextColor(todo ? OK : MAL);
@@ -399,6 +448,11 @@ public class OpcionesActivity extends Activity {
         guardar();
         if (!comprobar()) {
             Toast.makeText(this, t("Faltan archivos del juego: mira el recuadro rojo", "Game files missing: see the red box"), Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (PreparacionActivity.faltaPreparar(this)) {   /* primero generar libjuego.so dentro del teléfono */
+            startActivity(new Intent(this, PreparacionActivity.class));
+            finish();
             return;
         }
         Intent i = new Intent(this, ProjectBaseballActivity.class);
